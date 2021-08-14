@@ -1,0 +1,189 @@
+scilla_version 0 
+
+import BoolUtils IntUtils ListUtils PairUtils
+
+library QVote 
+
+let zero = Uint32 0 
+let uint128_zero = Uint128 0
+let one = Uint32 1
+let bool_true = True
+
+let register_address_list: List ByStr20 -> List Uint32 -> Map ByStr20 Uint32 = 
+	fun(addresses: List ByStr20) => 
+	fun(balances: List Uint32) =>
+		let init = Emp ByStr20 Uint32 in 
+		let zip = @list_zip ByStr20 Uint32 in
+    let zipped = zip addresses balances in
+    let foldleft = @list_foldl (Pair ByStr20 Uint32) (Map ByStr20 Uint32) in
+    let f = @fst ByStr20 Uint32 in 
+    let s = @snd ByStr20 Uint32 in 
+    let insert = 
+      fun(acc : Map ByStr20 Uint32) => 
+      fun(address_credits_p : Pair ByStr20 Uint32) => 
+        let address = f address_credits_p in 
+        let balance = s address_credits_p in 
+        builtin put acc address balance
+		in foldleft insert init zipped
+        
+let pos_uint128_sqrt: Uint128 -> Uint128 =
+  fun(i: Uint128) =>
+    let uint = builtin to_uint128 i in
+    match uint with
+      | Some c =>
+        let sqrt = builtin isqrt c in
+        let uint = builtin to_uint128 sqrt in
+        match uint with 
+        | Some cast_int =>
+          cast_int
+        | None =>
+          Uint128 0
+        end
+      | None =>
+        Uint128 0
+    end
+
+let uint128_credit_to_vote: Uint128 -> Uint128 =
+   fun(i : Uint128) =>
+    pos_uint128_sqrt i  
+    
+let uint32_to_uint128: Uint32 -> Uint128 =
+  fun(i : Uint32) =>
+    let res = builtin to_uint128 i in
+    match res with
+      | Some c => c
+      | None => Uint128 0
+    end
+
+let check_valid_times = 
+  fun(current: BNum) => 
+  fun(decision: BNum) =>
+    builtin blt current decision
+        
+let get_val =
+  fun (some_val: Option Uint128) =>
+  match some_val with
+  | Some val => val
+  | None => uint128_zero
+  end
+
+(* registration codes *) 
+let owner_register_success_code = Uint32 1
+
+(* vote codes *)
+let vote_success_code = Uint32 2
+
+(* events *)
+let vote_success_event = {_eventname: "vote_success"; code: vote_success_code}
+let owner_register_event_success = {_eventname: "owner_register_success"; code: owner_register_success_code}
+
+(* Error events *)
+type Error =
+| CodeSenderIsNotOwner
+| CodeTransitionOwnerRegisterMutipleCall
+| CodeNotInTime
+| CodeSenderNotRegisteredToVote
+
+(* Library functions *)
+let make_error_event =
+  fun (result : Error) =>
+    let result_code = 
+      match result with
+      | CodeSenderIsNotOwner                      => Int32 -1
+      | CodeTransitionOwnerRegisterMutipleCall    => Int32 -2
+      | CodeNotInTime                             => Int32 -3
+      | CodeSenderNotRegisteredToVote             => Int32 -4
+      end
+    in
+    { _exception : "Error"; code : result_code }
+
+contract QVote 
+(
+  owner: ByStr20,
+  expiration_block: BNum, (* last block at which votes are accepted *)
+  name: String,           (* decision name *) 
+  description: String
+)
+
+field voter_balances : Map ByStr20 Uint32 = Emp ByStr20 Uint32
+
+field votes : Map String Uint128 = Emp String Uint128
+
+field owner_register_called : Bool = False
+
+(* Emit Errors *)
+procedure EmitError(err : Error)
+  e = make_error_event err;
+  throw e
+end
+
+(* CENTRALIZED  
+this transition is only used at the moment, until we either find a decentralized oracle,
+or we can access another contract's state directly *)
+
+(* Only owner can call this transition ONCE after registration_end_time has passed and before expiration_block  *)
+transition owner_register(addresses : List ByStr20, credits : List Uint32)
+  blk <- & BLOCKNUMBER;
+  in_time = check_valid_times blk expiration_block;
+  match in_time with 
+  | True =>
+    is_owner = builtin eq _sender owner; 
+    match is_owner with
+    | False => 
+      e = CodeSenderIsNotOwner;
+      EmitError e
+    | True => 
+      is_called <- owner_register_called;
+      match is_called with
+      | True =>
+        e = CodeTransitionOwnerRegisterMutipleCall;
+        EmitError e
+      | False =>
+        voter_balances_ = register_address_list addresses credits; 
+        voter_balances := voter_balances_; 
+        owner_register_called := bool_true;
+        e = owner_register_event_success; 
+        event e
+      end
+    end
+  | False =>
+    e = CodeNotInTime;
+    EmitError e
+  end
+end 
+
+(* 
+    @notice: vote on the decision
+    @param: option: Option to vote for
+*)
+transition vote(option: String)	
+  blk <- & BLOCKNUMBER;
+  in_time = check_valid_times blk expiration_block; 
+  match in_time with 
+  | False => 
+    e = CodeNotInTime;
+    EmitError e
+  | True => 
+  	(* get voter balance *)
+  	voter_balance <- voter_balances[_sender];
+  	match voter_balance with
+  	 | Some voter_b =>
+  	   (* voter balance to uint128 *)
+      	voter_balance_uint128 = uint32_to_uint128 voter_b;
+      	voter_votes_uint128 = uint128_credit_to_vote voter_balance_uint128;
+      	
+        (* do voting stuff *)
+        some_prev_vote <- votes[option];
+        prev_vote = get_val some_prev_vote;
+        new_vote = builtin add prev_vote voter_votes_uint128;
+        votes[option] := new_vote;
+        (* can vote only once *)
+        voter_balances[_sender] := zero;
+        e = vote_success_event; 
+        event e
+  	 | None =>
+        e = CodeSenderNotRegisteredToVote;
+        EmitError e
+  	end
+  end
+end
